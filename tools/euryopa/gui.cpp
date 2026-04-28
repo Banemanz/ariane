@@ -7,6 +7,7 @@
 #include "updater.h"
 #include "icons.h"
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -59,6 +60,13 @@ static char gBrowserSelectedIde[256];
 static bool gBrowserTabRestorePending;
 static int gDiffFilter;
 static int gRenderMode;
+static float gOffsetSelectMinX = -3000.0f;
+static float gOffsetSelectMinY = -3000.0f;
+static float gOffsetSelectMaxX = 3000.0f;
+static float gOffsetSelectMaxY = 3000.0f;
+static float gOffsetTargetX = 0.0f;
+static float gOffsetTargetY = 0.0f;
+static bool gOffsetCurrentAreaOnly = false;
 
 enum BrowserTabId
 {
@@ -163,6 +171,193 @@ static int
 getDefaultCustomImportStartId(void)
 {
 	return isSA() ? 18631 : 0;
+}
+
+static bool
+selectInstancesInPerimeter(float minX, float minY, float maxX, float maxY, bool currentAreaOnly, int *outCount)
+{
+	float loX = min(minX, maxX);
+	float hiX = max(minX, maxX);
+	float loY = min(minY, maxY);
+	float hiY = max(minY, maxY);
+	int count = 0;
+
+	ClearSelection();
+	for(CPtrNode *p = instances.first; p; p = p->next){
+		ObjectInst *inst = (ObjectInst*)p->item;
+		if(inst == nil || inst->m_isDeleted)
+			continue;
+		if(currentAreaOnly && inst->m_area != currentArea)
+			continue;
+		if(inst->m_translation.x < loX || inst->m_translation.x > hiX ||
+		   inst->m_translation.y < loY || inst->m_translation.y > hiY)
+			continue;
+		inst->Select();
+		count++;
+	}
+
+	if(outCount)
+		*outCount = count;
+	return count > 0;
+}
+
+static void
+updateRwFrameForOffset(ObjectInst *inst)
+{
+	if(inst == nil || inst->m_rwObject == nil)
+		return;
+	ObjectDef *obj = GetObjectDef(inst->m_objectId);
+	if(obj == nil)
+		return;
+	rw::Frame *f;
+	if(obj->m_type == ObjectDef::ATOMIC)
+		f = ((rw::Atomic*)inst->m_rwObject)->getFrame();
+	else
+		f = ((rw::Clump*)inst->m_rwObject)->getFrame();
+	f->transform(&inst->m_matrix, rw::COMBINEREPLACE);
+}
+
+static bool
+offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
+{
+	auto rebuildAllInstanceSectors = [](){
+		for(int y = 0; y < numSectorsY; y++)
+			for(int x = 0; x < numSectorsX; x++){
+				Sector *s = GetSector(x, y);
+				s->buildings.Flush();
+				s->buildings_overlap.Flush();
+				s->bigbuildings.Flush();
+				s->bigbuildings_overlap.Flush();
+			}
+		outOfBoundsSector.buildings.Flush();
+		outOfBoundsSector.buildings_overlap.Flush();
+		outOfBoundsSector.bigbuildings.Flush();
+		outOfBoundsSector.bigbuildings_overlap.Flush();
+
+		for(CPtrNode *p = instances.first; p; p = p->next){
+			ObjectInst *inst = (ObjectInst*)p->item;
+			if(inst == nil || inst->m_isDeleted)
+				continue;
+			ObjectDef *obj = GetObjectDef(inst->m_objectId);
+			if(obj && obj->m_colModel)
+				InsertInstIntoSectors(inst);
+		}
+	};
+
+	UndoTransform transforms[MAX_BATCH_OBJECTS];
+	int numChunkTransforms = 0;
+	int moved = 0;
+	int movedWithCol = 0;
+	float minX = 0.0f, minY = 0.0f;
+	bool anchorSet = false;
+	std::vector<ObjectInst*> moveList;
+	std::unordered_set<ObjectInst*> seen;
+	moveList.reserve(1024);
+
+	auto addMoveInst = [&](ObjectInst *inst){
+		if(inst == nil || inst->m_isDeleted)
+			return;
+		if(seen.find(inst) != seen.end())
+			return;
+		seen.insert(inst);
+		moveList.push_back(inst);
+	};
+
+	for(CPtrNode *p = selection.first; p; p = p->next){
+		ObjectInst *inst = (ObjectInst*)p->item;
+		if(inst == nil || inst->m_isDeleted)
+			continue;
+		addMoveInst(inst);
+		if(!anchorSet){
+			minX = inst->m_translation.x;
+			minY = inst->m_translation.y;
+			anchorSet = true;
+		}else{
+			minX = min(minX, inst->m_translation.x);
+			minY = min(minY, inst->m_translation.y);
+		}
+	}
+	if(!anchorSet){
+		if(outMoved)
+			*outMoved = 0;
+		return false;
+	}
+
+	// Include linked LOD/HD partners so large map offsets keep visual pairs
+	// together (prevents far LODs/trees from appearing "not moved").
+	for(CPtrNode *p = selection.first; p; p = p->next){
+		ObjectInst *inst = (ObjectInst*)p->item;
+		if(inst == nil || inst->m_isDeleted)
+			continue;
+		if(inst->m_lod)
+			addMoveInst(inst->m_lod);
+	}
+	for(CPtrNode *p = instances.first; p; p = p->next){
+		ObjectInst *inst = (ObjectInst*)p->item;
+		if(inst == nil || inst->m_isDeleted)
+			continue;
+		if(inst->m_lod && seen.find(inst->m_lod) != seen.end())
+			addMoveInst(inst);
+	}
+
+	float dx = targetX - minX;
+	float dy = targetY - minY;
+
+	for(size_t i = 0; i < moveList.size(); i++){
+		ObjectInst *inst = moveList[i];
+
+		UndoTransform &t = transforms[numChunkTransforms];
+		t.inst = inst;
+		t.oldPos = inst->m_translation;
+		t.oldRot = inst->m_rotation;
+		t.flags = 0;
+
+		ObjectDef *obj = GetObjectDef(inst->m_objectId);
+		if(obj && obj->m_colModel)
+			movedWithCol++;
+
+		inst->m_translation.x += dx;
+		inst->m_translation.y += dy;
+		inst->UpdateMatrix();
+		updateRwFrameForOffset(inst);
+		inst->m_isDirty = true;
+		StampChangeSeq(inst);
+		t.newPos = inst->m_translation;
+		t.newRot = inst->m_rotation;
+		t.flags |= UNDO_TRANSFORM_POS;
+		numChunkTransforms++;
+		moved++;
+
+		// Undo storage is capped per action, so flush in chunks.
+		if(numChunkTransforms >= MAX_BATCH_OBJECTS){
+			UndoRecordTransformBatch(transforms, numChunkTransforms);
+			numChunkTransforms = 0;
+		}
+	}
+
+	// For large moves, rebuilding the sector index once is much faster than
+	// remove/insert per instance (which scans all sectors each time).
+	if(movedWithCol > 0){
+		const int BULK_REBUILD_THRESHOLD = 256;
+		if(movedWithCol >= BULK_REBUILD_THRESHOLD){
+			rebuildAllInstanceSectors();
+		}else{
+			for(size_t i = 0; i < moveList.size(); i++){
+				ObjectInst *inst = moveList[i];
+				ObjectDef *obj = GetObjectDef(inst->m_objectId);
+				if(obj && obj->m_colModel){
+					RemoveInstFromSectors(inst);
+					InsertInstIntoSectors(inst);
+				}
+			}
+		}
+	}
+
+	if(numChunkTransforms > 0)
+		UndoRecordTransformBatch(transforms, numChunkTransforms);
+	if(outMoved)
+		*outMoved = moved;
+	return moved > 0;
 }
 
 static void
@@ -5440,6 +5635,44 @@ uiToolsWindow(void)
 		if(gBrushDelayMs > 10000.0f) gBrushDelayMs = 10000.0f;
 		ImGui::SetItemTooltip("Minimum time between drag-paint bursts, in milliseconds.\n"
 			"0 = no delay. Combines with Spacing — both constraints must pass.");
+	}
+
+	ImGui::Separator();
+
+	// Selection offset tool
+	if(ImGui::CollapsingHeader("Selection Offset (XY perimeter)")){
+		ImGui::TextWrapped("Select everything in XY bounds (all Z), then offset the full selection to a target XY.");
+		ImGui::InputFloat("Min X", &gOffsetSelectMinX, 10.0f, 100.0f, "%.2f");
+		ImGui::InputFloat("Min Y", &gOffsetSelectMinY, 10.0f, 100.0f, "%.2f");
+		ImGui::InputFloat("Max X", &gOffsetSelectMaxX, 10.0f, 100.0f, "%.2f");
+		ImGui::InputFloat("Max Y", &gOffsetSelectMaxY, 10.0f, 100.0f, "%.2f");
+		ImGui::Checkbox("Current interior only", &gOffsetCurrentAreaOnly);
+		ImGui::SetItemTooltip("When enabled, only instances in the current interior/area are included.");
+		if(ImGui::Button("Select in perimeter (all Z)")){
+			int count = 0;
+			if(selectInstancesInPerimeter(gOffsetSelectMinX, gOffsetSelectMinY, gOffsetSelectMaxX, gOffsetSelectMaxY,
+			                              gOffsetCurrentAreaOnly, &count))
+				Toast(TOAST_SELECTION, "Selected %d object(s) in perimeter", count);
+			else
+				Toast(TOAST_SELECTION, "No objects found in perimeter");
+		}
+
+		ImGui::SeparatorText("Offset target");
+		ImGui::InputFloat("Target A (X)", &gOffsetTargetX, 10.0f, 100.0f, "%.2f");
+		ImGui::InputFloat("Target B (Y)", &gOffsetTargetY, 10.0f, 100.0f, "%.2f");
+		ImGui::TextDisabled("Anchor: selected min X/min Y \xE2\x86\x92 target A/B. Z stays unchanged.");
+		if(ImGui::Button("Offset selected to target XY")){
+			int moved = 0;
+			if(offsetSelectedToTargetXY(gOffsetTargetX, gOffsetTargetY, &moved)){
+				Toast(TOAST_SELECTION, "Offset %d object(s) to target XY", moved);
+				if(moved > MAX_BATCH_OBJECTS)
+					Toast(TOAST_SELECTION, "Undo was split into %d steps (%d objects/step max)",
+					      (moved + MAX_BATCH_OBJECTS - 1) / MAX_BATCH_OBJECTS, MAX_BATCH_OBJECTS);
+			}else
+				Toast(TOAST_SELECTION, "No selected objects to offset");
+		}
+		ImGui::SameLine();
+		ImGui::TextDisabled("Tip: Undo works (Ctrl+Z)");
 	}
 
 	ImGui::Separator();
