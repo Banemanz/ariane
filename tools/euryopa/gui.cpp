@@ -241,7 +241,7 @@ offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
 		t.inst = inst;
 		t.oldPos = inst->m_translation;
 		t.oldRot = inst->m_rotation;
-		t.flags = UNDO_POS;
+		t.flags = UNDO_TRANSFORM_POS;
 
 		ObjectDef *obj = GetObjectDef(inst->m_objectId);
 		if(obj && obj->m_colModel)
