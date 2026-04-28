@@ -203,9 +203,8 @@ selectInstancesInPerimeter(float minX, float minY, float maxX, float maxY, bool 
 static bool
 offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
 {
-	ObjectInst *picked[MAX_BATCH_OBJECTS];
 	UndoTransform transforms[MAX_BATCH_OBJECTS];
-	int numPicked = 0;
+	int numChunkTransforms = 0;
 	int moved = 0;
 	float minX = 0.0f, minY = 0.0f;
 	bool anchorSet = false;
@@ -214,9 +213,6 @@ offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
 		ObjectInst *inst = (ObjectInst*)p->item;
 		if(inst == nil || inst->m_isDeleted)
 			continue;
-		if(numPicked >= MAX_BATCH_OBJECTS)
-			break;
-		picked[numPicked++] = inst;
 		if(!anchorSet){
 			minX = inst->m_translation.x;
 			minY = inst->m_translation.y;
@@ -235,9 +231,12 @@ offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
 	float dx = targetX - minX;
 	float dy = targetY - minY;
 
-	for(int i = 0; i < numPicked; i++){
-		ObjectInst *inst = picked[i];
-		UndoTransform &t = transforms[moved];
+	for(CPtrNode *p = selection.first; p; p = p->next){
+		ObjectInst *inst = (ObjectInst*)p->item;
+		if(inst == nil || inst->m_isDeleted)
+			continue;
+
+		UndoTransform &t = transforms[numChunkTransforms];
 		t.inst = inst;
 		t.oldPos = inst->m_translation;
 		t.oldRot = inst->m_rotation;
@@ -254,11 +253,18 @@ offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
 
 		if(obj && obj->m_colModel)
 			InsertInstIntoSectors(inst);
+		numChunkTransforms++;
 		moved++;
+
+		// Undo storage is capped per action, so flush in chunks.
+		if(numChunkTransforms >= MAX_BATCH_OBJECTS){
+			UndoRecordTransformBatch(transforms, numChunkTransforms);
+			numChunkTransforms = 0;
+		}
 	}
 
-	if(moved > 0)
-		UndoRecordTransformBatch(transforms, moved);
+	if(numChunkTransforms > 0)
+		UndoRecordTransformBatch(transforms, numChunkTransforms);
 	if(outMoved)
 		*outMoved = moved;
 	return moved > 0;
@@ -5567,9 +5573,12 @@ uiToolsWindow(void)
 		ImGui::TextDisabled("Anchor: selected min X/min Y \xE2\x86\x92 target A/B. Z stays unchanged.");
 		if(ImGui::Button("Offset selected to target XY")){
 			int moved = 0;
-			if(offsetSelectedToTargetXY(gOffsetTargetX, gOffsetTargetY, &moved))
+			if(offsetSelectedToTargetXY(gOffsetTargetX, gOffsetTargetY, &moved)){
 				Toast(TOAST_SELECTION, "Offset %d object(s) to target XY", moved);
-			else
+				if(moved > MAX_BATCH_OBJECTS)
+					Toast(TOAST_SELECTION, "Undo was split into %d steps (%d objects/step max)",
+					      (moved + MAX_BATCH_OBJECTS - 1) / MAX_BATCH_OBJECTS, MAX_BATCH_OBJECTS);
+			}else
 				Toast(TOAST_SELECTION, "No selected objects to offset");
 		}
 		ImGui::SameLine();
