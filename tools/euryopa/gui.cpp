@@ -7,6 +7,7 @@
 #include "updater.h"
 #include "icons.h"
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -249,11 +250,24 @@ offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
 	int movedWithCol = 0;
 	float minX = 0.0f, minY = 0.0f;
 	bool anchorSet = false;
+	std::vector<ObjectInst*> moveList;
+	std::unordered_set<ObjectInst*> seen;
+	moveList.reserve(1024);
+
+	auto addMoveInst = [&](ObjectInst *inst){
+		if(inst == nil || inst->m_isDeleted)
+			return;
+		if(seen.find(inst) != seen.end())
+			return;
+		seen.insert(inst);
+		moveList.push_back(inst);
+	};
 
 	for(CPtrNode *p = selection.first; p; p = p->next){
 		ObjectInst *inst = (ObjectInst*)p->item;
 		if(inst == nil || inst->m_isDeleted)
 			continue;
+		addMoveInst(inst);
 		if(!anchorSet){
 			minX = inst->m_translation.x;
 			minY = inst->m_translation.y;
@@ -269,13 +283,28 @@ offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
 		return false;
 	}
 
-	float dx = targetX - minX;
-	float dy = targetY - minY;
-
+	// Include linked LOD/HD partners so large map offsets keep visual pairs
+	// together (prevents far LODs/trees from appearing "not moved").
 	for(CPtrNode *p = selection.first; p; p = p->next){
 		ObjectInst *inst = (ObjectInst*)p->item;
 		if(inst == nil || inst->m_isDeleted)
 			continue;
+		if(inst->m_lod)
+			addMoveInst(inst->m_lod);
+	}
+	for(CPtrNode *p = instances.first; p; p = p->next){
+		ObjectInst *inst = (ObjectInst*)p->item;
+		if(inst == nil || inst->m_isDeleted)
+			continue;
+		if(inst->m_lod && seen.find(inst->m_lod) != seen.end())
+			addMoveInst(inst);
+	}
+
+	float dx = targetX - minX;
+	float dy = targetY - minY;
+
+	for(size_t i = 0; i < moveList.size(); i++){
+		ObjectInst *inst = moveList[i];
 
 		UndoTransform &t = transforms[numChunkTransforms];
 		t.inst = inst;
@@ -313,10 +342,8 @@ offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
 		if(movedWithCol >= BULK_REBUILD_THRESHOLD){
 			rebuildAllInstanceSectors();
 		}else{
-			for(CPtrNode *p = selection.first; p; p = p->next){
-				ObjectInst *inst = (ObjectInst*)p->item;
-				if(inst == nil || inst->m_isDeleted)
-					continue;
+			for(size_t i = 0; i < moveList.size(); i++){
+				ObjectInst *inst = moveList[i];
 				ObjectDef *obj = GetObjectDef(inst->m_objectId);
 				if(obj && obj->m_colModel){
 					RemoveInstFromSectors(inst);
