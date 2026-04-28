@@ -200,6 +200,22 @@ selectInstancesInPerimeter(float minX, float minY, float maxX, float maxY, bool 
 	return count > 0;
 }
 
+static void
+updateRwFrameForOffset(ObjectInst *inst)
+{
+	if(inst == nil || inst->m_rwObject == nil)
+		return;
+	ObjectDef *obj = GetObjectDef(inst->m_objectId);
+	if(obj == nil)
+		return;
+	rw::Frame *f;
+	if(obj->m_type == ObjectDef::ATOMIC)
+		f = ((rw::Atomic*)inst->m_rwObject)->getFrame();
+	else
+		f = ((rw::Clump*)inst->m_rwObject)->getFrame();
+	f->transform(&inst->m_matrix, rw::COMBINEREPLACE);
+}
+
 static bool
 offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
 {
@@ -274,6 +290,8 @@ offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
 		inst->m_translation.x += dx;
 		inst->m_translation.y += dy;
 		inst->UpdateMatrix();
+		updateRwFrameForOffset(inst);
+		inst->m_isDirty = true;
 		StampChangeSeq(inst);
 		t.newPos = inst->m_translation;
 		t.newRot = inst->m_rotation;
