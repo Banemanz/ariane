@@ -203,9 +203,34 @@ selectInstancesInPerimeter(float minX, float minY, float maxX, float maxY, bool 
 static bool
 offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
 {
+	auto rebuildAllInstanceSectors = [](){
+		for(int y = 0; y < numSectorsY; y++)
+			for(int x = 0; x < numSectorsX; x++){
+				Sector *s = GetSector(x, y);
+				s->buildings.Flush();
+				s->buildings_overlap.Flush();
+				s->bigbuildings.Flush();
+				s->bigbuildings_overlap.Flush();
+			}
+		outOfBoundsSector.buildings.Flush();
+		outOfBoundsSector.buildings_overlap.Flush();
+		outOfBoundsSector.bigbuildings.Flush();
+		outOfBoundsSector.bigbuildings_overlap.Flush();
+
+		for(CPtrNode *p = instances.first; p; p = p->next){
+			ObjectInst *inst = (ObjectInst*)p->item;
+			if(inst == nil || inst->m_isDeleted)
+				continue;
+			ObjectDef *obj = GetObjectDef(inst->m_objectId);
+			if(obj && obj->m_colModel)
+				InsertInstIntoSectors(inst);
+		}
+	};
+
 	UndoTransform transforms[MAX_BATCH_OBJECTS];
 	int numChunkTransforms = 0;
 	int moved = 0;
+	int movedWithCol = 0;
 	float minX = 0.0f, minY = 0.0f;
 	bool anchorSet = false;
 
@@ -240,19 +265,19 @@ offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
 		t.inst = inst;
 		t.oldPos = inst->m_translation;
 		t.oldRot = inst->m_rotation;
-		t.flags = UNDO_TRANSFORM_POS;
+		t.flags = 0;
 
 		ObjectDef *obj = GetObjectDef(inst->m_objectId);
 		if(obj && obj->m_colModel)
-			RemoveInstFromSectors(inst);
+			movedWithCol++;
 
 		inst->m_translation.x += dx;
 		inst->m_translation.y += dy;
 		inst->UpdateMatrix();
 		StampChangeSeq(inst);
-
-		if(obj && obj->m_colModel)
-			InsertInstIntoSectors(inst);
+		t.newPos = inst->m_translation;
+		t.newRot = inst->m_rotation;
+		t.flags |= UNDO_TRANSFORM_POS;
 		numChunkTransforms++;
 		moved++;
 
@@ -260,6 +285,26 @@ offsetSelectedToTargetXY(float targetX, float targetY, int *outMoved)
 		if(numChunkTransforms >= MAX_BATCH_OBJECTS){
 			UndoRecordTransformBatch(transforms, numChunkTransforms);
 			numChunkTransforms = 0;
+		}
+	}
+
+	// For large moves, rebuilding the sector index once is much faster than
+	// remove/insert per instance (which scans all sectors each time).
+	if(movedWithCol > 0){
+		const int BULK_REBUILD_THRESHOLD = 256;
+		if(movedWithCol >= BULK_REBUILD_THRESHOLD){
+			rebuildAllInstanceSectors();
+		}else{
+			for(CPtrNode *p = selection.first; p; p = p->next){
+				ObjectInst *inst = (ObjectInst*)p->item;
+				if(inst == nil || inst->m_isDeleted)
+					continue;
+				ObjectDef *obj = GetObjectDef(inst->m_objectId);
+				if(obj && obj->m_colModel){
+					RemoveInstFromSectors(inst);
+					InsertInstIntoSectors(inst);
+				}
+			}
 		}
 	}
 
